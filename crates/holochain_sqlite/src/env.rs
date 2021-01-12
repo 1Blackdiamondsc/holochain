@@ -13,9 +13,10 @@ use parking_lot::RwLock;
 use parking_lot::RwLockReadGuard;
 use rkv::EnvironmentFlags;
 use rkv::Rkv;
+use rusqlite::{Connection, Transaction};
 use shrinkwraprs::Shrinkwrap;
 use std::collections::hash_map;
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,7 +25,7 @@ const DEFAULT_INITIAL_MAP_SIZE: usize = 100 * 1024 * 1024; // 100MB
 const MAX_DBS: u32 = 32;
 
 lazy_static! {
-    static ref ENVIRONMENTS: RwLock<HashMap<PathBuf, EnvironmentWrite>> = {
+    static ref INITIALIZED_DBS: RwLock<HashSet<PathBuf>> = {
         // This is just a convenient place that we know gets initialized
         // both in the final binary holochain && in all relevant tests
         //
@@ -46,7 +47,7 @@ lazy_static! {
             // std::process::abort();
         }));
 
-        RwLock::new(HashMap::new())
+        RwLock::new(HashSet::new())
     };
 }
 
@@ -84,7 +85,7 @@ fn rkv_builder(
     }
 }
 
-/// A read-only version of [EnvironmentWrite].
+/// A read-only version of [DbConnection].
 /// This environment can only generate read-only transactions, never read-write.
 #[derive(Clone)]
 pub struct EnvironmentRead {
@@ -95,7 +96,7 @@ pub struct EnvironmentRead {
 }
 
 impl EnvironmentRead {
-    /// Get a read-only lock on the EnvironmentWrite. The most typical use case is
+    /// Get a read-only lock on the DbConnection. The most typical use case is
     /// to get a lock in order to create a read-only transaction. The lock guard
     /// must outlive the transaction, so it has to be returned here and managed
     /// explicitly.
@@ -105,7 +106,7 @@ impl EnvironmentRead {
         }
     }
 
-    /// Accessor for the [EnvironmentKind] of the EnvironmentWrite
+    /// Accessor for the [EnvironmentKind] of the DbConnection
     pub fn kind(&self) -> &EnvironmentKind {
         &self.kind
     }
@@ -124,39 +125,50 @@ impl EnvironmentRead {
 /// The canonical representation of a (singleton) LMDB environment.
 /// The wrapper contains methods for managing transactions
 /// and database connections,
-#[derive(Clone, Shrinkwrap, Into, derive_more::From)]
-pub struct EnvironmentWrite(EnvironmentRead);
+#[derive(Shrinkwrap, Into, derive_more::From)]
+pub struct DbConnection {
+    path: PathBuf,
+    #[shrinkwrap(main_field)]
+    conn: Connection,
+    keystore: KeystoreSender,
+}
 
-impl EnvironmentWrite {
+impl Clone for DbConnection {
+    fn clone(&self) -> Self {
+        Self::from_path_and_keystore(self.path.clone(), self.keystore.clone())
+    }
+}
+
+impl DbConnection {
     /// Create an environment,
     pub fn new(
         path_prefix: &Path,
         kind: EnvironmentKind,
         keystore: KeystoreSender,
-    ) -> DatabaseResult<EnvironmentWrite> {
-        let mut map = ENVIRONMENTS.write();
+    ) -> DatabaseResult<DbConnection> {
+        let mut map = INITIALIZED_DBS.write();
         let path = path_prefix.join(kind.path());
-        if !path.is_dir() {
+        if !path.exists() {
             std::fs::create_dir(path.clone())
                 .map_err(|_e| DatabaseError::EnvironmentMissing(path.clone()))?;
         }
-        let env: EnvironmentWrite = match map.entry(path.clone()) {
-            hash_map::Entry::Occupied(e) => e.get().clone(),
-            hash_map::Entry::Vacant(e) => e
-                .insert({
-                    let rkv = rkv_builder(None, None)(&path)?;
-                    tracing::debug!("Initializing databases for path {:?}", path);
-                    initialize_databases(&rkv, &kind)?;
-                    EnvironmentWrite(EnvironmentRead {
-                        arc: Arc::new(RwLock::new(rkv)),
-                        kind,
-                        keystore,
-                        path,
-                    })
-                })
-                .clone(),
-        };
+        let added = map.insert(path.clone());
+        if !added {
+            tracing::debug!("Initializing database for path {:?}", path);
+            initialize_databases()?;
+        }
+        let env = DbConnection::from_path_and_keystore(path, keystore);
         Ok(env)
+    }
+
+    fn from_path_and_keystore(path: PathBuf, keystore: KeystoreSender) -> Self {
+        Self {
+            // TODO: are we OK with this panic?
+            conn: Connection::open(&path)
+                .expect("Could not establish connection to SQLite database"),
+            path,
+            keystore,
+        }
     }
 
     /// Create a Cell environment (slight shorthand)
@@ -170,17 +182,20 @@ impl EnvironmentWrite {
 
     /// Get a read-only lock guard on the environment.
     /// This reference can create read-write transactions.
-    pub fn guard(&self) -> EnvironmentWriteRef<'_> {
-        EnvironmentWriteRef(self.0.guard())
+    pub fn guard(&mut self) -> &mut Self {
+        &mut self
+    }
+
+    pub fn txn(&mut self) -> DatabaseResult<Transaction> {
+        Ok(self.conn.transaction()?)
     }
 
     /// Remove the db and directory
     pub async fn remove(self) -> DatabaseResult<()> {
-        let mut map = ENVIRONMENTS.write();
-        map.remove(&self.0.path);
-        // TODO remove this db from the DB_MAP_MAP?
+        let mut map = INITIALIZED_DBS.write();
+        map.remove(&self.path);
         // remove the directory
-        std::fs::remove_dir_all(&self.0.path)?;
+        std::fs::remove_dir_all(&self.path)?;
         Ok(())
     }
 }
@@ -209,34 +224,24 @@ impl EnvironmentKind {
         }
     }
 }
-/// A reference to a read-only EnvironmentRead.
-/// This has the distinction of being unable to create a read-write transaction,
-/// because unlike [EnvironmentWriteRef], this does not implement WriteManager
-pub struct EnvironmentReadRef<'e> {
-    rkv: RwLockReadGuard<'e, Rkv>,
-}
-
-impl<'e> EnvironmentReadRef<'e> {
-    /// Access the wrapped Rkv
-    pub fn rkv(&self) -> &Rkv {
-        &self.rkv
-    }
-}
 
 /// Implementors are able to create a new read-only LMDB transaction
-pub trait ReadManager<'e> {
-    /// Create a new read-only LMDB transaction
-    fn reader(&'e self) -> DatabaseResult<Reader<'e>>;
+pub trait ReadManager {
+    #[deprecated = "use txn() instead"]
+    fn reader(&mut self) -> DatabaseResult<Transaction> {
+        self.txn()
+    }
 
-    /// Run a closure, passing in a new read-only transaction
+    /// Run a closure, passing in a new transaction
+    #[deprecated = "use with_txn() instead"]
     fn with_reader<E, R, F: Send>(&self, f: F) -> Result<R, E>
     where
         E: From<DatabaseError>,
-        F: FnOnce(Reader) -> Result<R, E>;
+        F: FnOnce(Transaction) -> Result<R, E>;
 }
 
 /// Implementors are able to create a new read-write LMDB transaction
-pub trait WriteManager<'e> {
+pub trait WriteManager {
     /// Run a closure, passing in a mutable reference to a read-write
     /// transaction, and commit the transaction after the closure has run.
     /// If there is a LMDB error, recover from it and re-run the closure.
@@ -247,74 +252,29 @@ pub trait WriteManager<'e> {
         F: FnOnce(&mut Writer) -> Result<R, E>;
 }
 
-impl<'e> ReadManager<'e> for EnvironmentReadRef<'e> {
-    fn reader(&'e self) -> DatabaseResult<Reader<'e>> {
-        let reader = Reader::from(self.rkv.read()?);
-        Ok(reader)
+impl ReadManager for DbConnection {
+    fn reader(&mut self) -> DatabaseResult<Transaction> {
+        Ok(self.conn.transaction()?)
     }
 
     fn with_reader<E, R, F: Send>(&self, f: F) -> Result<R, E>
     where
         E: From<DatabaseError>,
-        F: FnOnce(Reader) -> Result<R, E>,
+        F: FnOnce(Transaction) -> Result<R, E>,
     {
         f(self.reader()?)
     }
 }
 
-impl<'e> WriteManager<'e> for EnvironmentWriteRef<'e> {
+impl WriteManager for DbConnection {
     fn with_commit<E, R, F: Send>(&self, f: F) -> Result<R, E>
     where
         E: From<DatabaseError>,
         F: FnOnce(&mut Writer) -> Result<R, E>,
     {
-        let mut writer = Writer::from(self.rkv.write().map_err(Into::into)?);
-        let result = f(&mut writer)?;
-        writer.commit().map_err(Into::into)?;
+        let mut txn = self.txn()?;
+        let result = f(&mut txn)?;
+        txn.commit()?;
         Ok(result)
-    }
-}
-
-impl<'e> WriteManager<'e> for EnvironmentWrite {
-    fn with_commit<E, R, F: Send>(&self, f: F) -> Result<R, E>
-    where
-        E: From<DatabaseError>,
-        F: FnOnce(&mut Writer) -> Result<R, E>,
-    {
-        EnvironmentWriteRef::with_commit(&self.guard(), f)
-    }
-}
-
-impl<'e> EnvironmentWriteRef<'e> {
-    /// Access the underlying Rkv lock guard
-    #[cfg(test)]
-    pub(crate) fn inner(&'e self) -> &Rkv {
-        &self.rkv
-    }
-
-    /// Get a raw read-write transaction for this environment.
-    /// It is preferable to use WriterManager::with_commit for database writes,
-    /// which can properly recover from and manage write failures
-    pub fn writer_unmanaged(&'e self) -> DatabaseResult<Writer<'e>> {
-        let writer = Writer::from(self.rkv.write()?);
-        Ok(writer)
-    }
-}
-
-/// A reference to a EnvironmentWrite
-#[derive(Shrinkwrap, Into)]
-pub struct EnvironmentWriteRef<'e>(EnvironmentReadRef<'e>);
-
-impl<'e> ReadManager<'e> for EnvironmentWriteRef<'e> {
-    fn reader(&'e self) -> DatabaseResult<Reader<'e>> {
-        self.0.reader()
-    }
-
-    fn with_reader<E, R, F: Send>(&self, f: F) -> Result<R, E>
-    where
-        E: From<DatabaseError>,
-        F: FnOnce(Reader) -> Result<R, E>,
-    {
-        self.0.with_reader(f)
     }
 }

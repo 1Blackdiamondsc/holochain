@@ -55,8 +55,8 @@ pub trait BufferedStore: Sized {
 /// Macro to generate a fresh reader from an EnvironmentRead with less boilerplate
 macro_rules! fresh_reader {
     ($env: expr, $f: expr) => {{
-        let g = $env.guard();
-        let r = $crate::env::ReadManager::reader(&g)?;
+        let mut g = $env.guard();
+        let r = $crate::env::ReadManager::reader(&mut g)?;
         $f(r)
     }};
 }

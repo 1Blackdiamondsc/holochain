@@ -128,7 +128,7 @@ async fn kv_store_sanity_check() -> DatabaseResult<()> {
     let mut kv1: KvBufUsed<DbString, TestVal> = KvBufUsed::new(db1);
     let mut kv2: KvBufUsed<DbString, DbString> = KvBufUsed::new(db2);
 
-    env.with_commit(|txn| {
+    env.with_commit(|mut txn| {
         kv1.put("hi".into(), testval.clone()).unwrap();
         kv2.put("salutations".into(), "folks".into()).unwrap();
         // Check that the underlying store contains no changes yet

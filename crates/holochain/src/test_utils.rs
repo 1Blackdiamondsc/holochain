@@ -63,9 +63,7 @@ macro_rules! here {
 /// expected functions, return data and with_f checks
 #[macro_export]
 macro_rules! meta_mock {
-    () => {{
-        holochain_state::metadata::MockMetadataBuf::new()
-    }};
+    () => {{ holochain_state::metadata::MockMetadataBuf::new() }};
     ($fun:ident) => {{
         let d: Vec<holochain_types::metadata::TimedHeaderHash> = Vec::new();
         meta_mock!($fun, d)

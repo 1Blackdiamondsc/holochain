@@ -41,6 +41,7 @@ pub enum DatabaseError {
     //     backtrace: Backtrace,
     // },
     #[error("Error interacting with the underlying LMDB store: {0}")]
+    #[deprecated = "lmdb related"]
     LmdbStoreError(#[from] failure::Compat<rkv::StoreError>),
 
     // TODO: the following is necessary for actual backtraces, and would be ideal,
@@ -53,7 +54,11 @@ pub enum DatabaseError {
     //     backtrace: Backtrace,
     // },
     #[error("Error when attempting an LMDB data transformation: {0}")]
+    #[deprecated = "lmdb related"]
     LmdbDataError(#[from] failure::Compat<rkv::DataError>),
+
+    #[error("Error talking to SQLite: {0}")]
+    SqliteError(#[from] rusqlite::Error),
 
     #[error("Error encoding to MsgPack: {0}")]
     MsgPackEncodeError(#[from] rmp_serde::encode::Error),

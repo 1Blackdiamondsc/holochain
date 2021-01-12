@@ -510,11 +510,8 @@ where
                                 cell_id.agent_pubkey().clone(),
                             );
 
-                            let env = EnvironmentWrite::new_cell(
-                                &dir,
-                                cell_id.clone(),
-                                keystore.clone(),
-                            )?;
+                            let env =
+                                EnvironmentWrite::new_cell(&dir, cell_id.clone(), keystore.clone())?;
                             Cell::create(
                                 cell_id.clone(),
                                 conductor_handle.clone(),

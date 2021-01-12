@@ -27,7 +27,7 @@ must_future = "0.1.1"
 nanoid = "0.3.0"
 parking_lot = "0.10"
 rand = "0.7"
-rkv = "=0.10.4"
+rusqlite = "0.24"
 rmp-serde = "0.15"
 serde = "1.0"
 serde_derive = "1.0"
@@ -38,6 +38,9 @@ tokio = { version = "0.2.11", features = [ "macros", "rt-threaded", "rt-util", "
 tokio_safe_block_on = "0.1.2"
 tracing = "0.1.18"
 tracing-futures = "0.2"
+
+# TODO: remove
+rkv = "=0.10.4"
 
 [dev-dependencies]
 observability = { version = "0.1.3" }

@@ -61,7 +61,7 @@ pub type DbName = TableName;
 
 /// Get access to the singleton database manager ([GetDb]),
 /// in order to access individual LMDB databases
-pub(super) fn initialize_databases(rkv: &Rkv, kind: &EnvironmentKind) -> DatabaseResult<()> {
+pub(super) fn initialize_databases() -> DatabaseResult<()> {
     todo!("create database and schema if not exists");
     Ok(())
 }
